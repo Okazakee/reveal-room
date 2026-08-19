@@ -1,9 +1,9 @@
 # Reveal Room — Product & Technical Specification
 
-> **Status:** v1.1 implementation specification  
+> **Status:** v1.2 implementation specification  
 > **Working product name:** Reveal Room  
 > **Last reviewed:** 2026-08-18  
-> **Functional source of truth:** `REVEAL_ROOM_SPEC.md`  
+> **Functional source of truth:** `REVEAL_ROOM_SPEC_v1.2.md`  
 > **Canonical visual source of truth:** `reveal-room-showroom.html`
 
 ---
@@ -31,7 +31,7 @@ Requirement IDs (`RR-*`) and acceptance criteria (`AC-*`) should be referenced i
 
 The implementation is governed by **two canonical artifacts**:
 
-1. `REVEAL_ROOM_SPEC.md` — product behavior, architecture, state, security, realtime, validation, accessibility, routes, and acceptance criteria.
+1. `REVEAL_ROOM_SPEC_v1.2.md` — product behavior, architecture, state, security, realtime, validation, accessibility, routes, and acceptance criteria.
 2. `reveal-room-showroom.html` — visual identity, composition, spacing, proportions, surface treatment, hierarchy, responsive feel, puzzle presentation, host dashboard styling, and final reveal styling.
 
 ### RR-SOT-001
@@ -203,8 +203,9 @@ Use:
 - React version supported by the selected Next.js version;
 - Node.js runtime;
 - plain CSS / CSS Modules or a small global CSS system;
-- native `EventSource` / Server-Sent Events for server → client updates;
+- Upstash Redis as the shared ephemeral room-state layer (production);
 - ordinary `fetch` for client → server mutations;
+- ordinary `fetch` polling for server → client room updates;
 - native Node.js/Web APIs for cryptography, timers, collections, streams, and IDs.
 
 Target Node.js 24 for production.
@@ -228,48 +229,46 @@ Runtime dependency budget:
 - `next`
 - `react`
 - `react-dom`
+- `@upstash/redis` (production shared room state only)
 
-No additional runtime dependency is expected for v1.
+No other runtime dependency is expected for v1.2.
 
 A test runner such as Vitest is allowed as a development dependency.
 
 ---
 
-# 4. Deployment model and critical constraint
+# 4. Deployment model
 
 ## 4.1 Canonical deployment
 
 ### RR-DEPLOY-001
-The canonical production deployment is **one persistent Node.js process** running the Next.js application.
+The canonical production deployment is **Vercel with Upstash Redis** as the shared ephemeral room-state layer.
 
-Examples:
+Room state lives in Redis, not in function-instance memory, so requests may be served by any number of horizontally scaled function instances. Redis TTL is the authoritative room cleanup mechanism.
 
-- `next build && next start`;
-- a single Docker container;
-- a single process supervised by systemd/PM2 without cluster mode.
-
-The process may restart and lose all rooms. That is expected behavior.
+A single-process Node.js deployment (a Docker container or a systemd/PM2 unit) remains a supported fallback for small self-hosted environments, but it is no longer the canonical v1.2 target.
 
 ### RR-DEPLOY-002
-Do not run more than one application instance if room state is in memory.
+Room state is shared through Redis. No request depends on a particular function instance.
 
-The host, player API requests, and SSE connections must all reach the same process.
-
-## 4.2 Serverless warning
+## 4.2 Vercel correctness
 
 ### RR-DEPLOY-003
-A Vercel/serverless deployment may be used for visual demos or best-effort testing, but **must not be documented as a reliable production deployment for multiplayer in-memory rooms**.
+Vercel function instances may be reused, replaced, paused, or horizontally scaled. v1.2 is correct under that model because:
 
-Reason: function instances may be reused, replaced, paused, or horizontally scaled; instance memory is not a shared state store.
+- room state is read/written through a Redis-backed repository;
+- every mutation runs under a per-room distributed lock;
+- client synchronization uses polling, not a process-local event stream;
+- Redis TTL replaces process garbage-collection timers.
 
-The README must clearly state this limitation.
+A room may still be lost on process restart only in the sense that Redis is ephemeral storage: rooms expire by TTL (empty rooms ~5 minutes after the last actor goes inactive, hard cap 24 hours). This is intended behavior, not durable storage.
 
 ## 4.3 No custom Next.js server
 
 ### RR-DEPLOY-004
 Do not introduce a custom Next.js HTTP server unless the standard Node.js deployment proves insufficient.
 
-Next.js Route Handlers plus streaming are the intended implementation.
+Next.js Route Handlers are the intended implementation.
 
 ---
 
@@ -294,11 +293,13 @@ DELETE /api/rooms/[code]
 
 POST   /api/rooms/[code]/join
 POST   /api/rooms/[code]/presence
-GET    /api/rooms/[code]/events
 GET    /api/rooms/[code]/challenge
 POST   /api/rooms/[code]/answer
 POST   /api/rooms/[code]/host-action
 ```
+
+There is no `events` endpoint in v1.2: client synchronization uses polling of
+`GET /api/rooms/{code}` (see §18).
 
 Every room API Route Handler must use the Node.js runtime explicitly where appropriate.
 
@@ -512,7 +513,7 @@ The token must never appear:
 - in query parameters;
 - in logs;
 - in public room state;
-- in SSE payloads.
+- in public room state or API payloads.
 
 Host mutations send:
 
@@ -544,7 +545,7 @@ The participant ID may be sent as a normal request field/header.
 
 ---
 
-# 9. In-memory state model
+# 9. Room state model
 
 The exact internal types may differ, but behavior must match the following model.
 
@@ -583,6 +584,7 @@ interface ChallengeInstance {
 }
 
 interface Room {
+  version: number
   code: string
   title: string
   secret: string
@@ -608,50 +610,104 @@ interface Room {
   createdAt: number
   startedAt?: number
   completedAt?: number
-
-  emptySince?: number
-
-  eventSequence: number
 }
 ```
 
-Implementation-specific subscriber/event-emitter data should not be serialized as room state.
+Notes for v1.2:
+
+- `version` starts at 1 and increments on every visible/state mutation. It is
+  exposed in public snapshots for polling clients.
+- `emptySince` and `eventSequence` from v1.1 are removed: TTL replaces
+  empty-room bookkeeping, and polling replaces event sequences.
+- Persisted state uses an explicit serializable representation (participants
+  as a record, not a `Map`). Runtime-only data (locks, Redis keys) is never
+  part of room state.
+- A room is stored as one serialized JSON object per code; whole-room
+  serialization is intentionally simple for party scale.
 
 ---
 
-# 10. Global runtime store
+# 10. Room repository and distributed state
 
-## 10.1 Singleton
+## 10.1 Repository boundary
 
 ### RR-RUNTIME-001
-Use a process-local singleton `RoomStore`.
+Game/domain code must not care whether room state comes from Redis or memory.
 
-Use `globalThis` in development to avoid accidental duplicate stores during module hot reload.
-
-Conceptually:
+Introduce a persistence boundary with this intent:
 
 ```ts
-globalThis.__revealRoomRuntime ??= createRuntime()
+interface RoomRepository {
+  create(room: Room): Promise<boolean>       // false on code collision
+  get(code: string): Promise<Room | null>
+  mutate<T>(code: string, operation: (room: Room) => T | Promise<T>): Promise<T | null>
+  delete(code: string): Promise<void>
+}
 ```
 
-The runtime owns:
+Production uses `RedisRoomRepository` backed by Upstash Redis. Tests and
+explicit local development modes use `MemoryRoomRepository`. There is exactly
+one copy of the business rules: the domain layer.
 
-- `Map<string, Room>`;
-- room event subscriptions;
-- garbage-collection interval;
-- in-memory rate-limit buckets if implemented.
+No production fallback to memory: if Redis configuration is missing in a
+production environment, repository construction must fail loudly, never
+silently use memory.
 
-## 10.2 Synchronous mutations
+## 10.2 Repository selection
+
+Environment policy:
+
+```text
+NODE_ENV=test
+    → MemoryRoomRepository
+
+development with USE_MEMORY_STORE=true
+    → MemoryRoomRepository
+
+otherwise (including all Vercel environments)
+    → RedisRoomRepository required (missing config = configuration error)
+```
+
+## 10.3 Distributed mutation lock
 
 ### RR-RUNTIME-002
-Room state mutations must be synchronous and atomic within the JavaScript event loop whenever possible.
+Vercel can execute two function instances mutating the same room concurrently.
 
-Do not place external asynchronous work between:
+Every room mutation must run under a per-room distributed lock:
 
-1. validating the current room/challenge state; and
-2. mutating that state.
+```text
+SET rr:lock:{code} {randomToken} NX PX 5000
+```
 
-This prevents obvious double-submit races without introducing locking infrastructure.
+- lock TTL: 5000 ms;
+- acquisition retries every ~40–100 ms, bounded maximum wait ~1500–2500 ms;
+- on acquisition timeout, return a retryable server error (503); never corrupt state;
+- release only with an atomic compare-and-release script (delete only if the
+  stored token equals the caller's token), always in `finally`.
+
+Canonical mutation flow inside the lock:
+
+```text
+1. acquire per-room lock
+2. GET room
+3. if missing → ROOM_NOT_FOUND
+4. deserialize
+5. validate auth / state / current challenge
+6. mutate domain state
+7. increment room.version
+8. recompute room expiry (see §11.4 / §41)
+9. SET serialized room with the computed expiry
+10. release lock (finally)
+```
+
+No external network work happens inside the lock beyond the minimum Redis
+operations required for the mutation.
+
+## 10.4 Room version
+
+Persisted rooms carry `version: number` (starting at 1), incremented on every
+visible/state mutation. Public snapshots expose `version` so polling clients
+can skip React state churn when nothing changed.
 
 ---
 
@@ -677,27 +733,32 @@ An actor is active if:
 
 This allows two missed heartbeats before the actor is considered gone.
 
-## 11.3 Five-minute room deletion
+## 11.3 Room expiry (replaces process deletion)
 
 ### RR-PRES-003
-When a room has zero active actors:
+Room deletion is TTL-driven in Redis; there is no process garbage-collection
+timer. A room expires approximately `5 minutes` after the final actor becomes
+inactive. Since an actor is active for 45 seconds after its last presence
+activity, the expiry candidate is:
 
-- active host count = 0; and
-- active participant count = 0;
+```text
+latest relevant lastSeenAt (host or any participant)
+  + PRESENCE_TIMEOUT_MS (45 s)
+  + EMPTY_ROOM_TTL_MS   (5 min)
+```
 
-set:
+capped by the absolute room TTL:
 
-`emptySince = now`
+```text
+roomExpiresAt = min(
+  createdAt + ABSOLUTE_ROOM_TTL_MS (24 h),
+  latestActorLastSeenAt + 45 s + 5 min
+)
+```
 
-If any actor returns before deletion:
-
-`emptySince = undefined`
-
-If the room remains empty for at least:
-
-`5 minutes`
-
-delete the room and all associated in-memory data.
+The Redis key is written with this absolute expiry. Any mutation that changes
+presence (heartbeat, join, authenticated activity) recomputes and reapplies
+the expiry. **Public room polling must never extend the expiry.**
 
 ### RR-PRES-004
 Presence means host **or** participant presence. A host keeping the control page open keeps the room alive.
@@ -705,12 +766,12 @@ Presence means host **or** participant presence. A host keeping the control page
 ## 11.4 Cleanup strategy
 
 ### RR-PRES-005
-Use both:
+Cleanup is authoritative Redis TTL only. No server-side interval sweeps, no
+opportunistic in-process sweeps.
 
-1. a process interval sweep every 15 seconds; and
-2. an opportunistic sweep before/after room-store operations.
-
-This ensures cleanup still occurs predictably even if interval scheduling is delayed.
+Because Redis expires the whole room key, `emptySince` bookkeeping is not
+needed in v1.2; the expiry formula models the same user-visible behavior
+(room dies ~5 minutes after the last actor's 45-second active window lapses).
 
 ## 11.5 Absolute TTL
 
@@ -719,9 +780,8 @@ Every room has a hard maximum lifetime of:
 
 `24 hours`
 
-After 24 hours it may be deleted even if clients are still active.
-
-This bounds accidental memory retention and is not user-configurable in v1.
+The expiry formula never exceeds `createdAt + 24 h`. This bounds accidental
+retention and is not user-configurable in v1.2.
 
 ## 11.6 Immediate delete
 
@@ -730,8 +790,7 @@ The host can explicitly delete a room at any time.
 
 Deletion:
 
-- removes state;
-- closes/notifies subscribers where possible;
+- removes the room key from Redis;
 - causes subsequent API calls to return room-not-found;
 - clears local host storage when the host UI receives the deletion state/error.
 
@@ -835,7 +894,7 @@ On Start:
 - set `startedAt`;
 - generate challenge 1;
 - assign challenge 1;
-- publish an SSE snapshot.
+- publish a fresh public snapshot (clients pick it up on their next poll).
 
 ---
 
@@ -959,12 +1018,13 @@ Reveal now:
 # 17. Public room snapshot
 
 ### RR-API-001
-Player-facing GET and SSE payloads must use a sanitized public state.
+Player-facing GET payloads must use a sanitized public state.
 
 Example conceptual type:
 
 ```ts
 interface PublicRoomState {
+  version: number
   code: string
   title: string
   locale: Locale
@@ -1017,69 +1077,67 @@ The following must never exist in public state:
 - participant token/hash;
 - challenge answer;
 - secret reveal order;
-- internal subscribers;
+- lock tokens;
+- Redis keys;
+- internal persisted fields (e.g. token hashes);
 - rate-limit state.
+
+`version` is the only persistence-adjacent value exposed, and it is safe
+(monotonic state marker).
 
 ---
 
-# 18. Server-Sent Events protocol
+# 18. Client synchronization — polling
 
-## 18.1 Why SSE
+## 18.1 Why polling
 
-The app needs:
-
-- server → browser room updates;
-- normal HTTP mutations browser → server.
-
-SSE is sufficient and keeps the architecture smaller than a bidirectional socket layer.
-
-## 18.2 Endpoint
-
-`GET /api/rooms/{code}/events`
-
-### RR-SSE-001
-Use `text/event-stream`.
-
-Recommended headers:
+Vercel functions are stateless and horizontally scaled, so a process-local
+event stream cannot broadcast room updates. Clients poll the sanitized public
+snapshot instead:
 
 ```text
-Content-Type: text/event-stream
-Cache-Control: no-cache, no-transform
-Connection: keep-alive
-X-Accel-Buffering: no
+browser
+   ├── GET /api/rooms/{code} every ~1000 ms
+   └── mutations through normal HTTP/fetch
 ```
 
-### RR-SSE-002
-Immediately send:
+## 18.2 Polling behavior
 
-```text
-retry: 3000
-event: snapshot
-data: {JSON_PUBLIC_ROOM_STATE}
-```
+### RR-POLL-001
+While a room UI is active, poll `GET /api/rooms/{code}` approximately every
+`1000 ms` (visible tab). Background/hidden tabs may poll less frequently
+(e.g. 2500–5000 ms) and must poll immediately on `visibilitychange → visible`.
 
-### RR-SSE-003
-After every meaningful room mutation, send a new full sanitized `snapshot`.
+### RR-POLL-002
+If the snapshot `version` is unchanged, avoid unnecessary React state churn.
 
-Do not build a complex client event reducer for v1. Full small snapshots are intentionally simpler.
+### RR-POLL-003
+After a mutation initiated by the current client, immediately fetch a fresh
+snapshot (or use the mutation response) so the acting client does not wait a
+full poll interval. Other clients update on their next poll.
 
-### RR-SSE-004
-Send a comment keepalive approximately every 15 seconds:
+### RR-POLL-004
+Error semantics:
 
-```text
-: ping
-```
+- transient network failure / 5xx / 429 → keep the last valid snapshot and
+  show a subtle reconnecting state;
+- authoritative `404 ROOM_NOT_FOUND` → room-gone state; stop polling and clear
+  stale local credentials;
+- one failed poll must never by itself show the room-gone state.
 
-### RR-SSE-005
-Clean up the subscriber when the request abort signal fires.
+### RR-POLL-005
+Polling is **not** presence. Only authenticated presence/activity mutations
+extend a room's expiry. Public GETs must never extend room TTL.
 
-### RR-SSE-006
-Browser clients use native `EventSource`.
+### RR-POLL-006
+Polling GET should remain read-only. If lifecycle normalization is needed
+(e.g. inactive assignee reassignment), the server may acquire the room lock and
+write only when normalization is actually required; it must not write on every
+poll.
 
-Clients must tolerate disconnects and automatic reconnects.
+---
 
-### RR-SSE-007
-SSE connectivity is **not** the authoritative presence mechanism. Authenticated heartbeats are.
+# 19. API contracts
 
 ---
 
@@ -1519,7 +1577,7 @@ Progress UI still advances normally.
 ## 24.6 Secret exposure rule
 
 ### RR-REVEAL-006
-Before full reveal, no API or SSE response sent to a player/spectator may include the full plaintext secret.
+Before full reveal, no API response sent to a player/spectator may include the full plaintext secret.
 
 Hiding plaintext with CSS is explicitly forbidden.
 
@@ -2105,28 +2163,30 @@ Dates are not important in room UI. Elapsed durations should be formatted withou
 # 31. Connection states
 
 ### RR-CONN-001
-Player and host pages track SSE state:
+Player and host pages track a connection state:
 
 - connecting;
 - connected;
-- reconnecting.
+- reconnecting;
+- gone.
 
 ### RR-CONN-002
-A temporary SSE disconnect must not eject the player.
-
-`EventSource` reconnect is expected.
+A temporary poll failure must not eject the player or wipe credentials.
+Transient network/5xx/429 failures keep the last valid snapshot and show a
+subtle reconnecting state; the next successful poll restores `connected`.
 
 ### RR-CONN-003
-If room GET/SSE indicates the room no longer exists:
+If polling returns an authoritative `404 ROOM_NOT_FOUND`:
 
 - stop heartbeats;
-- close EventSource;
+- stop polling;
 - clear stale local room credentials;
 - show localized `This room is gone` state;
 - provide a link to home.
 
 ### RR-CONN-004
-A reconnect should fetch/receive a fresh full snapshot, making the UI self-healing.
+Every successful poll delivers a fresh full snapshot, making the UI
+self-healing after reconnects.
 
 ---
 
@@ -2135,13 +2195,15 @@ A reconnect should fetch/receive a fresh full snapshot, making the UI self-heali
 This is not an internet-scale security system. It must still be bounded.
 
 ### RR-LIMIT-001
-Maximum rooms in one process:
+The previous v1.1 process-specific cap ("maximum rooms in one process: 250")
+does not map to serverless Redis and is removed. Room count is bounded by:
 
-`250`
+- Redis TTL cleanup (rooms expire automatically);
+- Upstash account/database limits;
+- creation rate limiting (below).
 
-Before rejecting creation, run a cleanup sweep.
-
-If still full, return `ROOM_LIMIT_REACHED`.
+Room creation still returns `ROOM_LIMIT_REACHED` only when the creation rate
+limit is exhausted.
 
 ### RR-LIMIT-002
 Maximum participants/spectators stored per room:
@@ -2159,7 +2221,7 @@ Bound string inputs according to this spec before storing them.
 Bound answer payload JSON size through reasonable route/body validation and reject obviously oversized/invalid shapes.
 
 ### RR-LIMIT-005
-Implement a small process-local fixed-window rate limiter for at least:
+Implement a fixed-window rate limiter for at least:
 
 - room creation;
 - join attempts;
@@ -2173,7 +2235,11 @@ Join:   30 / minute / IP
 Answer: 120 / minute / participant
 ```
 
-Exact internal structure may be simple `Map` buckets with expiry.
+On Vercel the limiter must be Redis-backed (cross-instance consistent):
+expiring counters using `INCR` + `EXPIRE` are sufficient. Tests and explicit
+local development modes may use a memory equivalent. IP extraction may use
+trusted proxy headers (`x-forwarded-for`) where available; this is lightweight
+abuse resistance, not strong identity.
 
 ### RR-LIMIT-006
 IP extraction may use trusted proxy headers where available, but this limiter must be documented as lightweight abuse resistance, not strong identity.
@@ -2303,10 +2369,10 @@ Using an injectable/fake clock where practical:
 
 - actor active within 45 s;
 - actor inactive after threshold;
-- `emptySince` starts when final actor becomes inactive;
+- `roomExpiresAt` moves forward with the latest actor activity;
 - room retained before 5 min;
 - room deleted at/after 5 min;
-- returning actor clears `emptySince`;
+- returning actor extends expiry;
 - absolute 24 h TTL deletes.
 
 ### AC-TEST-007 — Party assignment
@@ -2377,9 +2443,9 @@ If the scaffold's standard scripts differ, provide equivalent scripts.
 ## AC-FLOW-004 — Reconnect
 
 1. Player joins.
-2. SSE connection is interrupted.
+2\. a poll request fails transiently.
 3. UI reports reconnecting.
-4. EventSource reconnects.
+4\. the next poll succeeds.
 5. Fresh snapshot restores current game state.
 6. Player identity is preserved by stored credentials.
 
@@ -2412,7 +2478,7 @@ This is expected, not a bug.
 Before completion:
 - inspect initial HTML;
 - inspect public room GET;
-- inspect SSE payloads;
+- inspect polling GET payloads;
 - inspect player challenge payload.
 
 The full secret must not be present.
@@ -2433,7 +2499,6 @@ src/
 │   │           ├── route.ts
 │   │           ├── join/route.ts
 │   │           ├── presence/route.ts
-│   │           ├── events/route.ts
 │   │           ├── challenge/route.ts
 │   │           ├── answer/route.ts
 │   │           └── host-action/route.ts
@@ -2477,7 +2542,8 @@ src/
 │   ├── runtime/
 │   │   ├── rate-limit.ts
 │   │   ├── room-store.ts
-│   │   └── singleton.ts
+│   │   ├── repository.ts
+│   │   └── rate-limit.ts
 │   ├── security/
 │   │   └── tokens.ts
 │   └── types.ts
@@ -2502,15 +2568,18 @@ Do not introduce global client state machinery.
 
 Each room page may use a focused hook such as:
 
-`useRoomConnection(code)`
+`useRoomPolling(code)`
 
 Responsibilities:
 
-- initial GET;
-- EventSource lifecycle;
+- immediate initial fetch;
+- poll the public snapshot approximately every 1 second (visible tab);
+- skip React state churn when `version` is unchanged;
 - latest public snapshot;
-- connection status;
-- cleanup on unmount.
+- connection status (connecting / connected / reconnecting / gone);
+- tolerate transient failures (keep last snapshot);
+- stop on unmount and when the room is permanently gone;
+- immediate refresh after local mutations and on `visibilitychange → visible`.
 
 ### RR-CLIENT-002
 A separate presence hook may:
@@ -2564,9 +2633,10 @@ Make the safe behavior structural rather than caller-dependent.
 
 ---
 
-# 41. Empty-room cleanup algorithm
+# 41. Room expiry algorithm
 
-Normative pseudocode:
+Normative formula. Redis TTL is the only cleanup mechanism; there is no sweep
+loop.
 
 ```ts
 const PRESENCE_TIMEOUT_MS = 45_000
@@ -2577,40 +2647,43 @@ function isActive(lastSeenAt: number, now: number) {
   return now - lastSeenAt <= PRESENCE_TIMEOUT_MS
 }
 
-function sweepRoom(room: Room, now: number) {
-  if (now - room.createdAt >= ABSOLUTE_ROOM_TTL_MS) {
-    deleteRoom(room.code, 'absolute_ttl')
-    return
-  }
-
-  const hostActive = isActive(room.hostPresence.lastSeenAt, now)
-
-  const anyParticipantActive = [...room.participants.values()]
-    .some((participant) => isActive(participant.presence.lastSeenAt, now))
-
-  const occupied = hostActive || anyParticipantActive
-
-  if (occupied) {
-    room.emptySince = undefined
-    handleInactiveChallengeAssignee(room, now)
-    return
-  }
-
-  room.emptySince ??= now
-
-  if (now - room.emptySince >= EMPTY_ROOM_TTL_MS) {
-    deleteRoom(room.code, 'empty_timeout')
-  }
+function roomExpiresAt(room: Room): number {
+  const latestActivity = Math.max(
+    room.hostPresence.lastSeenAt,
+    ...[...room.participants.values()].map((p) => p.presence.lastSeenAt),
+  )
+  return Math.min(
+    room.createdAt + ABSOLUTE_ROOM_TTL_MS,
+    latestActivity + PRESENCE_TIMEOUT_MS + EMPTY_ROOM_TTL_MS,
+  )
 }
 ```
 
+The repository applies `roomExpiresAt` on every room write:
+
+- room creation counts the host as initially active (expiry computed from
+  `createdAt`);
+- heartbeat and authenticated activity mutations recompute and reapply expiry;
+- public polling GET does not write and therefore does not extend expiry;
+- completion keeps normal presence/empty-room expiry (the room still expires
+  ~5 minutes after the last actor goes inactive);
+- explicit delete removes the key immediately;
+- the 24-hour absolute TTL is never exceeded.
+
+Inactive assignee reassignment cannot rely on a background sweep. Deterministic
+room operations (heartbeat, game mutations, and the public-read path) check
+whether the current assignee exceeded the 45-second presence window; if so and
+another eligible active game player exists, the same challenge (answer
+unchanged) is reassigned under the room lock. The public-read path performs
+this write only when normalization is actually needed.
+
 Important:
 
-- room creation itself should count the host as initially active;
 - authenticated activity refreshes presence;
-- do not use SSE connection count as the deletion authority;
-- inactive participant records may remain inside an occupied room until the room is reset/deleted;
-- global limits keep this bounded.
+- polling connection count is not the presence authority;
+- inactive participant records may remain inside an occupied room until the
+  room is reset/deleted;
+- TTL keeps storage bounded.
 
 ---
 
@@ -2739,7 +2812,7 @@ Covers:
 ## T04 — Runtime RoomStore and lifecycle
 
 Implement:
-- singleton;
+- room repository (Redis-backed);
 - room creation;
 - join/resume;
 - game state machine;
@@ -2762,18 +2835,17 @@ Implement all required Route Handlers.
 Covers:
 API contracts, authentication, validation, no-store behavior.
 
-## T06 — SSE transport
+## T06 — Client polling transport
 
 Implement:
-- subscriber management;
-- initial snapshot;
-- snapshot broadcasts;
-- keepalive;
-- abort cleanup;
-- reconnect-safe client behavior.
+- polling hook (`useRoomPolling`);
+- version-aware snapshot refresh;
+- transient-failure tolerance;
+- gone-state handling;
+- visibility resume.
 
 Covers:
-`RR-SSE-*`, `RR-CONN-*`.
+`RR-POLL-*`, `RR-CONN-*`.
 
 ## T07 — i18n and shared UI system
 
@@ -2888,11 +2960,11 @@ The application is complete only when all conditions are true.
 
 ## Realtime
 
-- [ ] SSE initial snapshot works.
+- [ ] Initial poll snapshot works.
 - [ ] Mutations appear on all clients.
 - [ ] Keepalive works.
 - [ ] Reconnect restores current state.
-- [ ] SSE connection count is not used as authoritative presence.
+- [ ] Polling is not used as authoritative presence.
 
 ## Security / correctness
 
@@ -2963,7 +3035,7 @@ These notes describe platform facts checked while preparing the spec on 2026-08-
 
 1. The current Next.js documentation lists Next.js 16.3.1 and a minimum Node.js version of 20.9.
 2. Next.js Route Handlers can stream raw responses with Web Streams and explicitly call out Server-Sent Events as a use case.
-3. Native browser `EventSource` is widely available and automatically reconnects after dropped SSE connections.
+3. Browser `fetch` polling is simple and works across stateless serverless instances; room state is shared through Upstash Redis, so any instance can serve any room.
 4. `Intl.Segmenter` is suitable for grapheme segmentation and is available across current modern browsers/runtimes.
 5. Next.js supports normal self-hosting as a Node.js server; a custom server is not required for this architecture.
 6. Vercel can reuse function instances and preserve memory during reuse, but functions can also scale to multiple instances.
@@ -3008,3 +3080,50 @@ Consequences:
 - Production: single container on the existing VPS (internal HTTP port 3010 bound to localhost; Nginx Proxy Manager proxies the public HTTPS domain to it, with SSE buffering disabled).
 - Vercel: demo/visual only; README states it is not correctness-safe for process-local multiplayer state.
 - No changes to application code, game rules, or the in-memory state model.
+
+---
+
+2026-08-19 — v1.2: room state moved from process-local memory to Upstash Redis for Vercel correctness
+
+Requirement(s): RR-DEPLOY-001, RR-DEPLOY-002, RR-DEPLOY-003, RR-RUNTIME-001, RR-RUNTIME-002
+
+Problem:
+Vercel production testing (v1.1) demonstrated that process-local room state is
+inconsistent across horizontally scaled function instances. The same live room
+produced simultaneous HTTP 200 and ROOM_NOT_FOUND responses, and SSE/mutation
+requests could observe different process-local states (exact reproduction:
+room `2GAT4R` — 10/10 parallel GETs OK immediately after create, then 1.5 s
+later 5 fresh GETs returned 1 OK and 4 ROOM_NOT_FOUND). A single-process VPS
+deployment was prepared as a fallback, but the product requirement is that
+Reveal Room runs reliably on Vercel production.
+
+Decision:
+- Vercel remains the canonical production platform;
+- room state moves to Upstash Redis (`@upstash/redis`, official SDK);
+- process-local SSE is removed;
+- client synchronization moves to lightweight polling of the public snapshot
+  (approximately 1 s, version-aware);
+- Redis TTL replaces process garbage-collection timers (expiry = latest actor
+  activity + 45 s active window + 5 min empty retention, hard-capped at
+  `createdAt + 24 h`);
+- per-room distributed mutation locking (SET NX PX, token-verified compare-and-
+  release) preserves atomic game state across concurrent function instances;
+- Redis-backed fixed-window rate limiting replaces the process-local limiter;
+- the process-specific 250-room global cap is removed (TTL + creation rate
+  limit + Upstash account limits bound storage);
+- a repository boundary (`RoomRepository`) keeps game/domain logic independent
+  of the storage backend; a memory repository remains for tests and explicit
+  local development modes, with no production fallback to memory.
+
+Reason:
+Vercel's execution model (instance reuse, replacement, horizontal scaling)
+cannot share function memory. Shared room state in Redis makes every instance
+equivalent, and polling removes the need for a process-local event stream.
+Product behavior and visual design remain unchanged.
+
+Consequences:
+- Canonical production: Vercel + Upstash Redis (spec v1.2).
+- The single-process VPS deployment remains as an optional fallback and is not
+  modified or deleted.
+- `REVEAL_ROOM_SPEC_v1.1.md` is preserved as history; v1.2 becomes the
+  canonical functional/technical source of truth.

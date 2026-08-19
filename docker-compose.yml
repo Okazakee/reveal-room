@@ -1,0 +1,21 @@
+# Reveal Room — canonical single-process production deployment.
+#
+# EXACTLY ONE container, EXACTLY ONE application process, no replicas,
+# no cluster mode, no persistent state volume (rooms are ephemeral in memory).
+#
+# The port is published on the host loopback only (127.0.0.1:3010). Nginx
+# Proxy Manager runs in host-network mode on the same machine and proxies the
+# public HTTPS domain to http://127.0.0.1:3010.
+services:
+  reveal-room:
+    build: .
+    image: reveal-room:1.0.0
+    container_name: reveal-room
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3010:3000"
+    # Intentionally no volumes: a container restart is allowed to destroy
+    # every room (spec RR-DEPLOY-001). Keep restart: unless-stopped so the
+    # process comes back after a host reboot.
+    deploy:
+      replicas: 1
