@@ -1,6 +1,7 @@
 "use client";
 
 import { useMemo, useState } from "react";
+import Image from "next/image";
 import { useRouter } from "next/navigation";
 import { Button } from "@/components/Button";
 import { SealMark } from "@/components/SealMark";
@@ -134,6 +135,15 @@ export default function LandingPage() {
 
       <section className="hero">
         <div>
+          <Image
+            className="hero-logo"
+            src="/logotext.png"
+            alt="Reveal Room"
+            width={2172}
+            height={724}
+            sizes="300px"
+            priority
+          />
           <h1>
             {t.landingHeadline} <span className="accent">{t.landingHeadlineAccent}</span>
           </h1>

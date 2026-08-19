@@ -1,5 +1,5 @@
 <p align="center">
-  <strong style="font-size: 2.2em; letter-spacing: -0.04em;">🔒 Reveal Room</strong>
+  <img src="public/logotext.png" alt="Reveal Room" width="543" />
 </p>
 
 <p align="center">

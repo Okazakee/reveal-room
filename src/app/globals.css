@@ -532,6 +532,12 @@ button {
   gap: 58px;
   align-items: center;
 }
+.hero-logo {
+  display: block;
+  width: min(300px, 52vw);
+  height: auto;
+  margin: 0 0 14px;
+}
 
 .hero h1 {
   font-size: clamp(55px, 7vw, 100px);
